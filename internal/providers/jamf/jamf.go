@@ -187,7 +187,7 @@ func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestati
 		unmarshalErr = json.Unmarshal(response, &computer)
 	}
 	if unmarshalErr != nil {
-		return shared.StepResponseData{Allow: false}, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", unmarshalErr)
+		return shared.StepResponseData{Allow: false}, fmt.Errorf("error when unmarshalling Jamf API JSON: %s", unmarshalErr)
 	}
 	if handlerMode == "mobiledevice" {
 		shared.WriteLog(fmt.Sprintf("Mobile device record %s has been matched for serial number %s", mobileDevice.MobileDevice.General.UDID, stepInputData.AttestationData.PermanentIdentifier), 1, 0)
@@ -281,7 +281,7 @@ func (client *Client) refreshAuthToken() error {
 	var authToken JamfAPIAuthToken
 	unmarshalErr := json.Unmarshal(body, &authToken)
 	if unmarshalErr != nil {
-		return fmt.Errorf("error fwhen unmarsalling json: %s", unmarshalErr)
+		return fmt.Errorf("error when unmarshalling JSON: %s", unmarshalErr)
 	}
 
 	// need to do more error checking here
@@ -292,7 +292,7 @@ func (client *Client) refreshAuthToken() error {
 	return nil
 }
 
-// refreshAuthToken is a private function that is responsible for handling a HTTP GET
+// doGet is a private function that is responsible for handling a HTTP GET
 // from Jamf Pro's API. If an error is found it is returned and this will chain back up
 // to a webhook deny response.
 func (client *Client) doGet(uri string) ([]byte, error) {
@@ -313,7 +313,7 @@ func (client *Client) doGet(uri string) ([]byte, error) {
 	request.Header.Add("accept", "application/json")
 	request.Header.Add("Authorization", fmt.Sprintf("Bearer %s", client.token.AccessToken))
 	response, err := httpClient.Do(request)
-	shared.WriteLog(fmt.Sprintf("Response from %s/api/oauth/token %+v", client.baseUrl, response), 2, 0)
+	shared.WriteLog(fmt.Sprintf("Response from %s%s: %+v", client.baseUrl, uri, response), 2, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%s", err.Error())
 	}

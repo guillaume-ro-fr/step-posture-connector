@@ -47,9 +47,9 @@ If you'd like to report any security issues, [send me a DM on the MacAdmins slac
 
 ## Deployment
 
-### Docker image (reccomended)
+### Docker image (recommended)
 
-Deployment via Docker is probably most simple and reccomended - particularly if you are already [running `step-ca` this way](https://hub.docker.com/r/smallstep/step-ca). All config can be done via environment variables as per the Configuration section below and a [docker-compose file](docker/docker-compose.yml) is included in this repository.
+Deployment via Docker is probably most simple and recommended - particularly if you are already [running `step-ca` this way](https://hub.docker.com/r/smallstep/step-ca). All config can be done via environment variables as per the Configuration section below and a [docker-compose file](docker/docker-compose.yml) is included in this repository.
 
 Releases of `step-posture-connector` [are available on Docker Hub as `jedda/step-posture-connector`](https://hub.docker.com/repository/docker/jedda/step-posture-connector).
 
@@ -159,7 +159,7 @@ Under my testing in the current implementations of Managed Device Attestation on
 
 Note that this "Device Provisioning UDID" is not the "Hardware UUID" (or UDID as reported to some MDMs), but instead the "Device Provisioning UDID" (viewable in macOS System Information/Report) which is not by default captured by MDM.
 
-When using MDM providers for matching, this means the Device Provisioning UDID isn't really a suitable candidate as a matching identifier, so for Jamf we currently support Device Serial Number only. I can't find a lot of documentation on this, so if i'm wrong here or there is a better way I'd love to be pointed in a better direction.
+When using MDM providers for matching, this means the Device Provisioning UDID isn't really a suitable candidate as a matching identifier, so for Jamf we currently support Device Serial Number only. I can't find a lot of documentation on this, so if I'm wrong here or there is a better way I'd love to be pointed in a better direction.
 
 ## Questions, Issues & Discussions
 

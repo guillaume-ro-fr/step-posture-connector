@@ -123,7 +123,7 @@ func main() {
 			shared.WriteLog(fmt.Sprintf("Initialised a handler & stored secret for webhook ID %s", ids[i]), 0, 0)
 
 		} else {
-			shared.WriteLog(fmt.Sprintf("Webhook ID or it's secret failed validation: %s, %s, %s", ids[i], idErr, secretErr), 1, 33)
+			shared.WriteLog(fmt.Sprintf("Webhook ID or its secret failed validation: %s, %s, %s", ids[i], idErr, secretErr), 1, 33)
 			os.Exit(1)
 		}
 	}
@@ -196,7 +196,7 @@ func main() {
 // handling before returning the decision to step-ca
 func webhookHandlerAttestDevice(w http.ResponseWriter, r *http.Request) {
 	handlerMode := r.URL.Query().Get("mode")
-	shared.WriteLog(fmt.Sprintf("Recieved a new webhook request for %s (mode=%s)", r.URL.Path, handlerMode), 2, 0)
+	shared.WriteLog(fmt.Sprintf("Received a new webhook request for %s (mode=%s)", r.URL.Path, handlerMode), 2, 0)
 	// authenticate the incoming request using step-ca signature
 	body, authErr := authenticateRequest(r)
 	if authErr != nil {
@@ -272,7 +272,7 @@ func validateRequest(stepInputData shared.StepAttestationRequestData) error {
 	shared.WriteLog(fmt.Sprintf("Will validate request for certificate (CN=%s).", commonName), 1, 0)
 	// check to ensure that we have a permanentIdentifier (serial number)
 	if stepInputData.AttestationData.PermanentIdentifier == "" {
-		return fmt.Errorf("recieved a request without a permanentIdentifier in attestationData")
+		return fmt.Errorf("received a request without a permanentIdentifier in attestationData")
 	}
 	// check to ensure that the permanentIdentifier is set as the commonName
 	// step-ca already enforces this, but lets double check just in case
