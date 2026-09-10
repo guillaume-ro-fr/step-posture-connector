@@ -15,6 +15,7 @@ import (
 	"github.com/jedda/step-posture-connector/internal/providers/jamf"
 	"github.com/jedda/step-posture-connector/internal/shared"
 	"github.com/joho/godotenv"
+	"github.com/smallstep/certificates/webhook"
 	"io"
 	"net/http"
 	"os"
@@ -33,7 +34,7 @@ var webhooks map[string]string
 // ProviderInterface defines the function signatures that a provider must implement
 type ProviderInterface interface {
 	Bootstrap() error
-	Handler(string, shared.StepAttestationRequestData) (shared.StepResponseData, error)
+	Handler(string, webhook.RequestBody) (webhook.ResponseBody, error)
 }
 
 // main execution function. validates config and bootstraps provider
@@ -151,7 +152,7 @@ func main() {
 			shared.WriteLog(fmt.Sprintf("Failed to load CA from TLS_CA_PATH: %s", err), 0, 33)
 			os.Exit(1)
 		}
-		caCn, err := shared.ValidatePEM(string(caCert), false)
+		caCn, err := shared.ValidatePEM(string(caCert))
 		if err != nil {
 			shared.WriteLog(fmt.Sprintf("Failed to validate CA for mTLS: %s", err), 0, 33)
 			os.Exit(1)
@@ -177,7 +178,7 @@ func main() {
 		shared.WriteLog(fmt.Sprintf("Failed to load local server TLS certificate from %s: %s", config["TLS_CERT_PATH"].(string), err), 0, 33)
 		os.Exit(1)
 	}
-	tlsCn, err := shared.ValidatePEM(string(caCert), false)
+	tlsCn, err := shared.ValidatePEM(string(caCert))
 	if err != nil {
 		shared.WriteLog(fmt.Sprintf("Failed to validate local server TLS certificate: %s", err), 0, 33)
 		os.Exit(1)
@@ -196,7 +197,7 @@ func main() {
 // handling before returning the decision to step-ca
 func webhookHandlerAttestDevice(w http.ResponseWriter, r *http.Request) {
 	handlerMode := r.URL.Query().Get("mode")
-	shared.WriteLog(fmt.Sprintf("Recieved a new webhook request for %s (mode=%s)", r.URL.Path, handlerMode), 2, 0)
+	shared.WriteLog(fmt.Sprintf("Received a new webhook request for %s (mode=%s)", r.URL.Path, handlerMode), 2, 0)
 	// authenticate the incoming request using step-ca signature
 	body, authErr := authenticateRequest(r)
 	if authErr != nil {
@@ -204,8 +205,8 @@ func webhookHandlerAttestDevice(w http.ResponseWriter, r *http.Request) {
 		deny(w, http.StatusUnauthorized)
 		return
 	}
-	// decode the incoming request JSON body into a StepAttestationRequestData struct
-	var stepInputData shared.StepAttestationRequestData
+	// decode the incoming request JSON body into a webhook.RequestBody struct
+	var stepInputData webhook.RequestBody
 	parseErr := json.NewDecoder(bytes.NewReader(body)).Decode(&stepInputData)
 	if parseErr != nil {
 		shared.WriteLog(fmt.Sprintf("[DENY] Failed to parse request: %s", parseErr), 0, 31)
@@ -255,29 +256,23 @@ func webhookHandlerAttestDevice(w http.ResponseWriter, r *http.Request) {
 // request. this happens post authentication, and performs some checks on the
 // submitted request including validation of the X.509 CSR data and attestation
 // identifiers. if validation fails, it returns an error.
-func validateRequest(stepInputData shared.StepAttestationRequestData) error {
-	// parse the timestamp from the request
-	ts, err := time.Parse(time.RFC3339, stepInputData.Timestamp)
-	if err != nil {
-		return fmt.Errorf("failed to parse request timestamp: %s - %s", err, stepInputData.Timestamp)
+func validateRequest(stepInputData webhook.RequestBody) error {
+	// as step-ca only populates these on an acme device-attest-01 challenge,
+	// they are optional pointers and need to be checked before we use them
+	if stepInputData.AttestationData == nil {
+		return fmt.Errorf("received a request without any attestationData")
+	}
+	// check that the request carries a timestamp
+	if stepInputData.Timestamp.IsZero() {
+		return fmt.Errorf("received a request without a timestamp")
 	}
 	// to ensure no replay, we check the timestamp is within the last 10 seconds
-	if time.Since(ts) > time.Duration(10)*time.Second {
-		return fmt.Errorf("request aged over 10 seconds: %s", stepInputData.Timestamp)
+	if time.Since(stepInputData.Timestamp) > time.Duration(10)*time.Second {
+		return fmt.Errorf("request aged over 10 seconds: %s", stepInputData.Timestamp.Format(time.RFC3339))
 	}
-	commonName, err := shared.ValidatePEM(stepInputData.X509CertificateRequest.Raw, true)
-	if err != nil {
-		return fmt.Errorf("failed to validate CSR: %s", err)
-	}
-	shared.WriteLog(fmt.Sprintf("Will validate request for certificate (CN=%s).", commonName), 1, 0)
 	// check to ensure that we have a permanentIdentifier (serial number)
 	if stepInputData.AttestationData.PermanentIdentifier == "" {
-		return fmt.Errorf("recieved a request without a permanentIdentifier in attestationData")
-	}
-	// check to ensure that the permanentIdentifier is set as the commonName
-	// step-ca already enforces this, but lets double check just in case
-	if stepInputData.AttestationData.PermanentIdentifier != commonName {
-		return fmt.Errorf("common name does not match permanentIdentifier")
+		return fmt.Errorf("received a request without a permanentIdentifier in attestationData")
 	}
 	return nil
 }
@@ -329,7 +324,7 @@ func authenticateRequest(r *http.Request) ([]byte, error) {
 // with a specific status code. it is used as part of errors or denials
 // and will exit fatally if the response cannot be marshaled as json
 func deny(w http.ResponseWriter, s int) {
-	deny := shared.StepResponseData{Allow: false}
+	deny := webhook.ResponseBody{Allow: false}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(s)
 	err := json.NewEncoder(w).Encode(deny)
@@ -343,7 +338,7 @@ func deny(w http.ResponseWriter, s int) {
 // allow is a private function that writes a allow to the http response
 // along with any included enrichment data. it will exit fatally
 // if the response cannot be marshaled as json
-func allow(w http.ResponseWriter, data shared.StepResponseData) {
+func allow(w http.ResponseWriter, data webhook.ResponseBody) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	err := json.NewEncoder(w).Encode(data)

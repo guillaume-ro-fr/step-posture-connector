@@ -1,4 +1,5 @@
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.21.4 as builder
+# Build
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25 AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
@@ -19,7 +20,8 @@ RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
   go build -o /step-posture-connector
 
-FROM --platform=${BUILDPLATFORM:-linux/amd64} gcr.io/distroless/base-debian12:nonroot
+# Run
+FROM --platform=${BUILDPLATFORM:-linux/amd64} gcr.io/distroless/base-debian12:nonroot AS runner
 
 WORKDIR /
 COPY --from=builder /step-posture-connector /

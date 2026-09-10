@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/go-playground/validator/v10"
 	"github.com/jedda/step-posture-connector/internal/shared"
+	"github.com/smallstep/certificates/webhook"
 	"io"
 	"os"
 	"strings"
@@ -71,14 +72,22 @@ func (p Provider) Bootstrap() error {
 }
 
 // Handler is a public function that is implemented as part of the Provider interface
-// It is responsible for handling an individual webhook request and returning StepResponseData
-func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestationRequestData) (shared.StepResponseData, error) {
+// It is responsible for handling an individual webhook request and returning a webhook.ResponseBody
+func (p Provider) Handler(handlerMode string, stepInputData webhook.RequestBody) (webhook.ResponseBody, error) {
+	if stepInputData.AttestationData == nil {
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("received a request without any attestationData")
+	}
 	for i := range data.Devices {
 		if data.Devices[i].Identifier == stepInputData.AttestationData.PermanentIdentifier {
-			return shared.StepResponseData{Allow: true, Data: data.Devices[i].Data}, nil
+			// Data is an any on webhook.ResponseBody, so an unpopulated map would
+			// still read as non-nil downstream - only set it when the device has data
+			if len(data.Devices[i].Data) > 0 {
+				return webhook.ResponseBody{Allow: true, Data: data.Devices[i].Data}, nil
+			}
+			return webhook.ResponseBody{Allow: true}, nil
 		}
 	}
-	return shared.StepResponseData{Allow: false}, fmt.Errorf("device identifier (%s) not matched in file", stepInputData.AttestationData.PermanentIdentifier)
+	return webhook.ResponseBody{Allow: false}, fmt.Errorf("device identifier (%s) not matched in file", stepInputData.AttestationData.PermanentIdentifier)
 }
 
 // parseJSON is a private function that unmarshals a JSON byte slice

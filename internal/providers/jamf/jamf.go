@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/go-playground/validator/v10"
 	"github.com/jedda/step-posture-connector/internal/shared"
+	"github.com/smallstep/certificates/webhook"
 	"io"
 	"net/http"
 	"net/url"
@@ -132,8 +133,8 @@ func (p Provider) Bootstrap() error {
 }
 
 // Handler is a public function that is implemented as part of the Provider interface
-// It is responsible for handling an individual webhook request and returning StepResponseData
-func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestationRequestData) (shared.StepResponseData, error) {
+// It is responsible for handling an individual webhook request and returning a webhook.ResponseBody
+func (p Provider) Handler(handlerMode string, stepInputData webhook.RequestBody) (webhook.ResponseBody, error) {
 
 	// for Jamf, we have two device types
 	// - Mobile Devices (iOS/iPad/iPhone)
@@ -158,22 +159,22 @@ func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestati
 	}
 	err := validate.Var(handlerMode, "required,oneof=computer mobiledevice")
 	if err != nil {
-		return shared.StepResponseData{Allow: false}, fmt.Errorf("invalid handler type: %s", err)
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("invalid handler type: %s", err)
 	}
 
 	// validate our attestation data
 	validateErr := validateAttestData(stepInputData)
 	if validateErr != nil {
-		return shared.StepResponseData{Allow: false}, validateErr
+		return webhook.ResponseBody{Allow: false}, validateErr
 	}
 
 	// grab our response from jamf pro's API
 	response, err := client.doGet(fmt.Sprintf("/JSSResource/%ss/serialnumber/%s", handlerMode, stepInputData.AttestationData.PermanentIdentifier))
 	if err != nil {
 		if err.Error() == "404" {
-			return shared.StepResponseData{Allow: false}, fmt.Errorf("serial number not found/enrolled (404 on \"/JSSResource/%ss/serialnumber/%s\")", handlerMode, stepInputData.AttestationData.PermanentIdentifier)
+			return webhook.ResponseBody{Allow: false}, fmt.Errorf("serial number not found/enrolled (404 on \"/JSSResource/%ss/serialnumber/%s\")", handlerMode, stepInputData.AttestationData.PermanentIdentifier)
 		} else {
-			return shared.StepResponseData{Allow: false}, fmt.Errorf("error whilst communicating with Jamf API: %s", err)
+			return webhook.ResponseBody{Allow: false}, fmt.Errorf("error whilst communicating with Jamf API: %s", err)
 		}
 	}
 
@@ -187,7 +188,7 @@ func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestati
 		unmarshalErr = json.Unmarshal(response, &computer)
 	}
 	if unmarshalErr != nil {
-		return shared.StepResponseData{Allow: false}, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", unmarshalErr)
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", unmarshalErr)
 	}
 	if handlerMode == "mobiledevice" {
 		shared.WriteLog(fmt.Sprintf("Mobile device record %s has been matched for serial number %s", mobileDevice.MobileDevice.General.UDID, stepInputData.AttestationData.PermanentIdentifier), 1, 0)
@@ -216,9 +217,9 @@ func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestati
 		}
 	}
 	if deviceGroup != "" && !groupMatch && handlerMode == "mobiledevice" {
-		return shared.StepResponseData{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, deviceGroup)
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, deviceGroup)
 	} else if computerGroup != "" && !groupMatch && handlerMode == "computer" {
-		return shared.StepResponseData{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, computerGroup)
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, computerGroup)
 	}
 
 	var enrichData map[string]interface{}
@@ -228,10 +229,12 @@ func (p Provider) Handler(handlerMode string, stepInputData shared.StepAttestati
 		enrichData = map[string]interface{}{"device": map[string]interface{}{"udid": computer.Computer.General.UDID, "serial_number": computer.Computer.General.SerialNumber, "name": computer.Computer.General.Name}, "user": map[string]interface{}{"username": computer.Computer.Location.Username, "realname": computer.Computer.Location.RealName, "email_address": computer.Computer.Location.EmailAddress, "position": computer.Computer.Location.Position, "department": computer.Computer.Location.Department}, "groups": groups}
 	}
 
-	if deviceEnrich || computerEnrich {
-		return shared.StepResponseData{Allow: true, Data: enrichData}, nil
+	// Data is an any on webhook.ResponseBody, so an unpopulated map would still
+	// read as non-nil downstream - only set it when we built enrichment data
+	if len(enrichData) > 0 {
+		return webhook.ResponseBody{Allow: true, Data: enrichData}, nil
 	} else {
-		return shared.StepResponseData{Allow: true}, nil
+		return webhook.ResponseBody{Allow: true}, nil
 	}
 }
 
@@ -335,7 +338,10 @@ func (client *Client) doGet(uri string) ([]byte, error) {
 // validation prior to asking Jamf. Currently it ensures a device serial number can be
 // validated against known formats. If an error is found it is returned and this will
 // chain back up to a webhook deny response.
-func validateAttestData(stepInputData shared.StepAttestationRequestData) error {
+func validateAttestData(stepInputData webhook.RequestBody) error {
+	if stepInputData.AttestationData == nil {
+		return fmt.Errorf("received a request without any attestationData")
+	}
 	errs := validate.Var(stepInputData.AttestationData.PermanentIdentifier, "required,alphanum,min=8,max=14")
 	if errs != nil {
 		return fmt.Errorf("serial number did not pass validation: %s", errs)
