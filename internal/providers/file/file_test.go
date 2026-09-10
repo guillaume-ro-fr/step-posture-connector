@@ -3,7 +3,7 @@ package file
 import (
 	"encoding/base64"
 	"encoding/json"
-	"github.com/jedda/step-posture-connector/internal/shared"
+	"github.com/smallstep/certificates/webhook"
 	"testing"
 )
 
@@ -62,7 +62,7 @@ func TestParseCSVInvalid(t *testing.T) {
 
 func TestJSONAttest(t *testing.T) {
 	p := Provider{}
-	stepRequest := shared.StepAttestationRequestData{}
+	stepRequest := webhook.RequestBody{}
 	// first parse and load devices from JSON
 	TestParseJSONValid(t)
 	b64Data := decodeB64(t, stepRequestB64)
@@ -81,7 +81,7 @@ func TestJSONAttest(t *testing.T) {
 
 func TestCSVAttest(t *testing.T) {
 	p := Provider{}
-	stepRequest := shared.StepAttestationRequestData{}
+	stepRequest := webhook.RequestBody{}
 	// first parse and load devices from JSON
 	TestParseCSVValid(t)
 	b64Data := decodeB64(t, stepRequestB64)
