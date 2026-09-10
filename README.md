@@ -68,20 +68,62 @@ A [Dockerfile](docker/Dockerfile) is also included should you wish to roll your 
 
 ## Webhooks
 
-Currently, there is a single webhook endpoint supported by `step-posture-connector`:
+`step-posture-connector` exposes two webhook endpoints, one per kind of request. Which one you
+point a provisioner's webhook at is what tells `step-posture-connector` - and forces, on the
+`step-ca` side - whether that request is validated as an ACME device attestation or a SCEP
+challenge:
 
-- `/webhook/device-attest` 
+- `/webhook/device-attest` for a provisioner's ACME (`device-attest-01`) `AUTHORIZING` or
+  `ENRICHING` webhook
+- `/webhook/scep-challenge` for a SCEP provisioner's `SCEPCHALLENGE` webhook (see "SCEP challenge
+  webhooks" below)
 
 For each webhook you create in [`step-ca`](https://github.com/smallstep/certificates), it will generate and display a `Webhook ID` and `Webhook Secret`. You'll need to supply these using the `WEBHOOK_IDS` and `WEBHOOK_SECRETS` configuration variable below to initialise the webhook for use. For more information on how to do this, see the [Setup Guide](https://github.com/jedda/step-posture-connector/wiki/Setup-Guide).
 
-The webhook endpoint takes an optional `type` query string that may be needed depending what device you are targeting. At the moment this is required only by Jamf, as the API endpoints it uses to search and match iOS devices vs computers is different and `step-posture-connector` must be told which one is being requested. For Jamf, the webhook format should be as follows:
+Both endpoints take an optional `mode` query string that may be needed depending what device you are targeting. At the moment this is required only by Jamf, as the API endpoints it uses to search and match iOS devices vs computers is different and `step-posture-connector` must be told which one is being requested. For Jamf, the webhook format should be as follows:
 
-- `/webhook/device-attest?mode=mobiledevice` for iOS devices
-- `/webhook/device-attest?mode=computer` for Mac computers
+- `/webhook/device-attest?mode=mobiledevice` and `/webhook/scep-challenge?mode=mobiledevice` for iOS devices
+- `/webhook/device-attest?mode=computer` and `/webhook/scep-challenge?mode=computer` for Mac computers
 
 Note that Jamf lookup will default to `mode=mobiledevice` if a mode is not defined, so only `mode=computer` is actually required to specifically target Macs. If you are using Jamf and want to target both iOS and Mac, youll need to create two different provisioners in [`step-ca`](https://github.com/smallstep/certificates) - one for each platform with it's own appropriate webhook pointing at the correct mode.
 
 The `file` and `mosyle` providers ignore the `mode` query and treat every device type as the same.
+
+Each endpoint only accepts the request shape it's meant for: pointing an ACME webhook at
+`/webhook/scep-challenge`, or a SCEP `SCEPCHALLENGE` webhook at `/webhook/device-attest`, is
+rejected with a clear configuration error rather than silently doing the wrong thing.
+
+### SCEP challenge webhooks
+
+`/webhook/scep-challenge` accepts `SCEPCHALLENGE` webhooks from a SCEP provisioner - add one
+pointing at this endpoint (see the `step ca provisioner webhook add ... --kind SCEPCHALLENGE`
+command in `step-ca`'s documentation) to have `step-posture-connector` validate SCEP enrollments
+the same way it validates ACME ones.
+
+For a SCEP request, `step-posture-connector` checks two things before allowing certificate issuance:
+
+1. the device serial number - read from the CSR subject's `serialNumber` attribute, or its common
+   name if that attribute is absent - is registered (and compliant, where the provider supports
+   compliance checks) with your chosen provider, exactly as for ACME;
+2. the SCEP challenge presented by the client matches the challenge expected for that device.
+
+The challenge check can work in one of two modes, configured per-provider (see the provider
+configuration tables below):
+
+- **Static** - a single challenge value, set directly as an environment variable
+  (`<PROVIDER>_SCEP_CHALLENGE`). Any enrolled device presenting this value will pass the challenge
+  check. This does not bind the challenge to a specific device - only the serial number lookup does
+  that - so it offers weaker device-specific security than the dynamic mode below, but is the
+  simplest option and mirrors `step-ca`'s built-in static SCEP `challenge`.
+- **Dynamic** - the *name* of a field on the device's record is set as an environment variable
+  (`<PROVIDER>_SCEP_CHALLENGE_KEY`), and `step-posture-connector` looks up that field's value, per
+  device, from your provider. This lets you generate a unique challenge per device (eg. via a Mosyle
+  custom field, or a Jamf extension attribute) and binds the challenge to the exact device it was
+  issued for.
+
+Only one of the two may be configured for a given provider - setting both will fail to bootstrap.
+If neither is set, SCEP requests are denied (with a clear error) while ACME requests continue to be
+served normally, so adding SCEP support is entirely optional for existing deployments.
 
 ## Compliance Group Membership
 
@@ -119,6 +161,8 @@ The following additional configuration variables apply when using the `file` pro
 | --- |  --- | ----------- |
 | `FILE_PATH` | required | Specifies the path to a file containing device data. |
 | `FILE_TYPE` | required | Specifies the file type. Currently needs to be one of `csv` or `json`. |
+| `FILE_SCEP_CHALLENGE` | optional | Specifies a static SCEP challenge. See "SCEP challenge webhooks" for details. Cannot be combined with `FILE_SCEP_CHALLENGE_KEY`. |
+| `FILE_SCEP_CHALLENGE_KEY` | optional | Specifies the field name (a column header for `csv`, or a key under `data` for `json`) holding each device's dynamic SCEP challenge. See "SCEP challenge webhooks" for details. Cannot be combined with `FILE_SCEP_CHALLENGE`. |
 
 ### Provider Configuration - Jamf Pro (`jamf`)
 
@@ -133,6 +177,8 @@ The following additional configuration variables apply when using the `jamf` pro
 | `JAMF_COMPUTER_GROUP` | optional | When included, specifies a Jamf Computer group to check membership against for Mac devices. |
 | `JAMF_DEVICE_ENRICH` | optional | Specifies if user enrichment data should be returned to `step-ca` for Mobile Devices. Needs to be `0` or `1`. Defaults to `0`. |
 | `JAMF_COMPUTER_ENRICH` | optional | Specifies if user enrichment data should be returned to `step-ca` for Computers. Needs to be `0` or `1`. Defaults to `0`. |
+| `JAMF_SCEP_CHALLENGE` | optional | Specifies a static SCEP challenge. See "SCEP challenge webhooks" for details. Cannot be combined with `JAMF_SCEP_CHALLENGE_KEY`. |
+| `JAMF_SCEP_CHALLENGE_KEY` | optional | Specifies the name of a Jamf extension attribute holding each device's dynamic SCEP challenge. See "SCEP challenge webhooks" for details. Cannot be combined with `JAMF_SCEP_CHALLENGE`. |
 
 ### Provider Configuration - Mosyle Business/Manager (`mosyle`)
 
@@ -146,6 +192,8 @@ The following additional configuration variables apply when using the `mosyle` p
 | `MOSYLE_PASSWORD` | required | Specifies the password of the Mosyle account used to obtain a bearer token. |
 | `MOSYLE_TAGS` | optional | When included, specifies a comma-delimited list of Mosyle tags. Devices must carry at least one of these tags to be allowed. |
 | `MOSYLE_ENRICH` | optional | Specifies if enrichment data should be returned to `step-ca`. Needs to be `0` or `1`. Defaults to `0`. |
+| `MOSYLE_SCEP_CHALLENGE` | optional | Specifies a static SCEP challenge. See "SCEP challenge webhooks" for details. Cannot be combined with `MOSYLE_SCEP_CHALLENGE_KEY`. |
+| `MOSYLE_SCEP_CHALLENGE_KEY` | optional | Specifies the Custom Device Attribute holding each device's dynamic SCEP challenge, matched against its unique identifier (eg. `%custom_cc_scepChallenge%` - surrounding `%` characters are stripped automatically, so a Mosyle profile variable can be pasted as-is) or, failing that, its display name. A deleted attribute is ignored. See "SCEP challenge webhooks" for details. Cannot be combined with `MOSYLE_SCEP_CHALLENGE`. |
 
 When `MOSYLE_ENRICH` is enabled, the following data is returned to `step-ca` and can be used in certificate templates:
 

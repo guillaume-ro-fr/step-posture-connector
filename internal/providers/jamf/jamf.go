@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -34,6 +35,15 @@ type JamfAPIAuthToken struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
+// JamfExtensionAttribute defines a single extension attribute entry, as returned by the Jamf
+// Classic API for both mobile devices and computers. It is how a dynamic SCEP challenge (or
+// any other custom field) is located on a device record - by attribute name.
+type JamfExtensionAttribute struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 // JamfClassicMobileDevice defines the JSON format returned from /JSSResource/mobiledevices/serialnumber/%s (Jamf API)
 type JamfClassicMobileDevice struct {
 	MobileDevice struct {
@@ -53,6 +63,7 @@ type JamfClassicMobileDevice struct {
 			ID   int    `json:"id"`
 			Name string `json:"name"`
 		} `json:"mobile_device_groups"`
+		ExtensionAttributes []JamfExtensionAttribute `json:"extension_attributes"`
 	} `json:"mobile_device"`
 }
 
@@ -74,12 +85,31 @@ type JamfClassicComputer struct {
 		GroupsAccounts struct {
 			ComputerGroupMemberships []string `json:"computer_group_memberships"`
 		} `json:"groups_accounts"`
+		ExtensionAttributes []JamfExtensionAttribute `json:"extension_attributes"`
 	} `json:"computer"`
+}
+
+// resolvedDevice normalises the fields shared by Jamf's mobile device and computer records,
+// so that Handler and SCEPHandler (and their shared helpers) don't need to branch on
+// handlerMode past the initial API lookup.
+type resolvedDevice struct {
+	UDID                string
+	Name                string
+	SerialNumber        string
+	Username            string
+	RealName            string
+	EmailAddress        string
+	Position            string
+	Department          string
+	Groups              []string
+	ExtensionAttributes []JamfExtensionAttribute
 }
 
 var client Client
 var validate *validator.Validate
 var config map[string]interface{}
+var scepStaticChallenge string
+var scepChallengeKey string
 
 // Bootstrap is a public function that is implemented as part of the Provider interface
 // It is responsible for setting up and testing the provider then letting the main package
@@ -87,28 +117,37 @@ var config map[string]interface{}
 func (p Provider) Bootstrap() error {
 	validate = validator.New(validator.WithRequiredStructEnabled())
 	config = map[string]interface{}{
-		"JAMF_BASE_URL":        os.Getenv("JAMF_BASE_URL"),
-		"JAMF_CLIENT_ID":       os.Getenv("JAMF_CLIENT_ID"),
-		"JAMF_CLIENT_SECRET":   os.Getenv("JAMF_CLIENT_SECRET"),
-		"JAMF_DEVICE_GROUP":    os.Getenv("JAMF_DEVICE_GROUP"),
-		"JAMF_COMPUTER_GROUP":  os.Getenv("JAMF_COMPUTER_GROUP"),
-		"JAMF_DEVICE_ENRICH":   os.Getenv("JAMF_DEVICE_ENRICH"),
-		"JAMF_COMPUTER_ENRICH": os.Getenv("JAMF_COMPUTER_ENRICH"),
-		"TIMEOUT":              os.Getenv("TIMEOUT"),
+		"JAMF_BASE_URL":           os.Getenv("JAMF_BASE_URL"),
+		"JAMF_CLIENT_ID":          os.Getenv("JAMF_CLIENT_ID"),
+		"JAMF_CLIENT_SECRET":      os.Getenv("JAMF_CLIENT_SECRET"),
+		"JAMF_DEVICE_GROUP":       os.Getenv("JAMF_DEVICE_GROUP"),
+		"JAMF_COMPUTER_GROUP":     os.Getenv("JAMF_COMPUTER_GROUP"),
+		"JAMF_DEVICE_ENRICH":      os.Getenv("JAMF_DEVICE_ENRICH"),
+		"JAMF_COMPUTER_ENRICH":    os.Getenv("JAMF_COMPUTER_ENRICH"),
+		"JAMF_SCEP_CHALLENGE":     os.Getenv("JAMF_SCEP_CHALLENGE"),
+		"JAMF_SCEP_CHALLENGE_KEY": os.Getenv("JAMF_SCEP_CHALLENGE_KEY"),
+		"TIMEOUT":                 os.Getenv("TIMEOUT"),
 	}
 	rules := map[string]interface{}{
-		"JAMF_BASE_URL":        "required,url",
-		"JAMF_CLIENT_ID":       "required,uuid",
-		"JAMF_CLIENT_SECRET":   "required",
-		"JAMF_DEVICE_GROUP":    "omitempty",
-		"JAMF_COMPUTER_GROUP":  "omitempty",
-		"JAMF_DEVICE_ENRICH":   "omitempty,oneof=0 1",
-		"JAMF_COMPUTER_ENRICH": "omitempty,oneof=0 1",
-		"TIMEOUT":              "omitempty,number,max=2",
+		"JAMF_BASE_URL":           "required,url",
+		"JAMF_CLIENT_ID":          "required,uuid",
+		"JAMF_CLIENT_SECRET":      "required",
+		"JAMF_DEVICE_GROUP":       "omitempty",
+		"JAMF_COMPUTER_GROUP":     "omitempty",
+		"JAMF_DEVICE_ENRICH":      "omitempty,oneof=0 1",
+		"JAMF_COMPUTER_ENRICH":    "omitempty,oneof=0 1",
+		"JAMF_SCEP_CHALLENGE":     "omitempty",
+		"JAMF_SCEP_CHALLENGE_KEY": "omitempty",
+		"TIMEOUT":                 "omitempty,number,max=2",
 	}
 	errs := validate.ValidateMap(config, rules)
 	if len(errs) > 0 {
 		return fmt.Errorf("Jamf failed to bootstrap due to invalid config: %s", errs)
+	}
+	scepStaticChallenge = config["JAMF_SCEP_CHALLENGE"].(string)
+	scepChallengeKey = strings.Trim(config["JAMF_SCEP_CHALLENGE_KEY"].(string), "%")
+	if scepStaticChallenge != "" && scepChallengeKey != "" {
+		return fmt.Errorf("JAMF_SCEP_CHALLENGE and JAMF_SCEP_CHALLENGE_KEY cannot both be set")
 	}
 	var timeout time.Duration
 	timeoutConfig, timeoutErr := strconv.ParseInt(config["TIMEOUT"].(string), 10, 32)
@@ -142,16 +181,8 @@ func (p Provider) Handler(handlerMode string, stepInputData webhook.RequestBody)
 	// we need to know the device type coming in as they have different API endpoints
 	// thus, the handlerMode string on this method as either "mobiledevice" or "computer"
 
-	deviceGroup, ok := config["JAMF_DEVICE_GROUP"].(string)
-	if !ok {
-		deviceGroup = ""
-	}
-	computerGroup, ok := config["JAMF_COMPUTER_GROUP"].(string)
-	if !ok {
-		computerGroup = ""
-	}
 	deviceEnrich, _ := strconv.ParseBool(config["JAMF_DEVICE_ENRICH"].(string))
-	computerEnrich, _ := strconv.ParseBool(config["JAMF_DEVICE_ENRICH"].(string))
+	computerEnrich, _ := strconv.ParseBool(config["JAMF_COMPUTER_ENRICH"].(string))
 
 	// default handlerMode to mobiledevice
 	if handlerMode == "" {
@@ -168,74 +199,185 @@ func (p Provider) Handler(handlerMode string, stepInputData webhook.RequestBody)
 		return webhook.ResponseBody{Allow: false}, validateErr
 	}
 
-	// grab our response from jamf pro's API
-	response, err := client.doGet(fmt.Sprintf("/JSSResource/%ss/serialnumber/%s", handlerMode, stepInputData.AttestationData.PermanentIdentifier))
+	resolved, err := resolveDevice(handlerMode, stepInputData.AttestationData.PermanentIdentifier)
+	if err != nil {
+		return webhook.ResponseBody{Allow: false}, err
+	}
+
+	enrich := (handlerMode == "mobiledevice" && deviceEnrich) || (handlerMode == "computer" && computerEnrich)
+	if enrich {
+		return webhook.ResponseBody{Allow: true, Data: buildEnrichData(resolved)}, nil
+	}
+	return webhook.ResponseBody{Allow: true}, nil
+}
+
+// SCEPHandler is a public function that is implemented as part of the Provider interface
+// It is responsible for handling an individual SCEP challenge validation webhook request.
+// It resolves the device serial number from the CSR subject, applies the same lookup and
+// compliance group check as Handler, and then checks the presented SCEP challenge against
+// either the configured static challenge or the value of the extension attribute named by
+// JAMF_SCEP_CHALLENGE_KEY.
+func (p Provider) SCEPHandler(handlerMode string, stepInputData webhook.RequestBody) (webhook.ResponseBody, error) {
+	deviceEnrich, _ := strconv.ParseBool(config["JAMF_DEVICE_ENRICH"].(string))
+	computerEnrich, _ := strconv.ParseBool(config["JAMF_COMPUTER_ENRICH"].(string))
+
+	if handlerMode == "" {
+		handlerMode = "mobiledevice"
+	}
+	if err := validate.Var(handlerMode, "required,oneof=computer mobiledevice"); err != nil {
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("invalid handler type: %s", err)
+	}
+	if stepInputData.X509CertificateRequest == nil || stepInputData.X509CertificateRequest.CertificateRequest == nil {
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("received a SCEP request without a usable x509CertificateRequest")
+	}
+	serial, err := shared.ExtractSCEPSerial(stepInputData.X509CertificateRequest.Subject.SerialNumber, stepInputData.X509CertificateRequest.Subject.CommonName)
+	if err != nil {
+		return webhook.ResponseBody{Allow: false}, err
+	}
+	if err := shared.ValidateSerial(serial); err != nil {
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("serial number did not pass validation: %s", err)
+	}
+
+	resolved, err := resolveDevice(handlerMode, serial)
+	if err != nil {
+		return webhook.ResponseBody{Allow: false}, err
+	}
+
+	expected, err := expectedChallenge(resolved)
+	if err != nil {
+		return webhook.ResponseBody{Allow: false}, err
+	}
+	if !shared.CompareChallenge(stepInputData.SCEPChallenge, expected) {
+		return webhook.ResponseBody{Allow: false}, fmt.Errorf("SCEP challenge mismatch for serial %s", serial)
+	}
+
+	enrich := (handlerMode == "mobiledevice" && deviceEnrich) || (handlerMode == "computer" && computerEnrich)
+	if enrich {
+		return webhook.ResponseBody{Allow: true, Data: buildEnrichData(resolved)}, nil
+	}
+	return webhook.ResponseBody{Allow: true}, nil
+}
+
+// resolveDevice is a private function shared by Handler and SCEPHandler. It looks up a
+// device by serial number for the given handlerMode ("mobiledevice" or "computer"),
+// normalises the response into a resolvedDevice, and enforces the optional compliance
+// group membership check.
+func resolveDevice(handlerMode, serial string) (*resolvedDevice, error) {
+	deviceGroup, _ := config["JAMF_DEVICE_GROUP"].(string)
+	computerGroup, _ := config["JAMF_COMPUTER_GROUP"].(string)
+
+	response, err := client.doGet(fmt.Sprintf("/JSSResource/%ss/serialnumber/%s", handlerMode, serial))
 	if err != nil {
 		if err.Error() == "404" {
-			return webhook.ResponseBody{Allow: false}, fmt.Errorf("serial number not found/enrolled (404 on \"/JSSResource/%ss/serialnumber/%s\")", handlerMode, stepInputData.AttestationData.PermanentIdentifier)
-		} else {
-			return webhook.ResponseBody{Allow: false}, fmt.Errorf("error whilst communicating with Jamf API: %s", err)
+			return nil, fmt.Errorf("serial number not found/enrolled (404 on \"/JSSResource/%ss/serialnumber/%s\")", handlerMode, serial)
 		}
+		return nil, fmt.Errorf("error whilst communicating with Jamf API: %s", err)
 	}
 
-	var mobileDevice JamfClassicMobileDevice
-	var computer JamfClassicComputer
-
-	var unmarshalErr error
-	if handlerMode == "mobiledevice" {
-		unmarshalErr = json.Unmarshal(response, &mobileDevice)
-	} else if handlerMode == "computer" {
-		unmarshalErr = json.Unmarshal(response, &computer)
-	}
-	if unmarshalErr != nil {
-		return webhook.ResponseBody{Allow: false}, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", unmarshalErr)
-	}
-	if handlerMode == "mobiledevice" {
-		shared.WriteLog(fmt.Sprintf("Mobile device record %s has been matched for serial number %s", mobileDevice.MobileDevice.General.UDID, stepInputData.AttestationData.PermanentIdentifier), 1, 0)
-	} else if handlerMode == "computer" {
-		shared.WriteLog(fmt.Sprintf("Computer record %s has been matched for serial number %s", computer.Computer.General.UDID, stepInputData.AttestationData.PermanentIdentifier), 1, 0)
-	}
-	// do we need to match to a compliance group?
+	resolved := &resolvedDevice{}
 	var groupMatch bool
-	var groups []string
-	if handlerMode == "mobiledevice" && deviceGroup != "" {
+
+	if handlerMode == "mobiledevice" {
+		var mobileDevice JamfClassicMobileDevice
+		if err := json.Unmarshal(response, &mobileDevice); err != nil {
+			return nil, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", err)
+		}
+		shared.WriteLog(fmt.Sprintf("Mobile device record %s has been matched for serial number %s", mobileDevice.MobileDevice.General.UDID, serial), 1, 0)
+		resolved.UDID = mobileDevice.MobileDevice.General.UDID
+		resolved.Name = mobileDevice.MobileDevice.General.Name
+		resolved.SerialNumber = mobileDevice.MobileDevice.General.SerialNumber
+		resolved.Username = mobileDevice.MobileDevice.Location.Username
+		resolved.RealName = mobileDevice.MobileDevice.Location.RealName
+		resolved.EmailAddress = mobileDevice.MobileDevice.Location.EmailAddress
+		resolved.Position = mobileDevice.MobileDevice.Location.Position
+		resolved.Department = mobileDevice.MobileDevice.Location.Department
+		resolved.ExtensionAttributes = mobileDevice.MobileDevice.ExtensionAttributes
 		for i := range mobileDevice.MobileDevice.MobileDeviceGroups {
-			groups = append(groups, mobileDevice.MobileDevice.MobileDeviceGroups[i].Name)
-			if mobileDevice.MobileDevice.MobileDeviceGroups[i].Name == deviceGroup {
+			name := mobileDevice.MobileDevice.MobileDeviceGroups[i].Name
+			resolved.Groups = append(resolved.Groups, name)
+			if deviceGroup != "" && name == deviceGroup {
 				groupMatch = true
-				shared.WriteLog(fmt.Sprintf("Mobile device record %s is a member of \"%s\"", mobileDevice.MobileDevice.General.UDID, deviceGroup), 1, 0)
+				shared.WriteLog(fmt.Sprintf("Mobile device record %s is a member of \"%s\"", resolved.UDID, deviceGroup), 1, 0)
 			}
 		}
-	}
-	if handlerMode == "computer" && computerGroup != "" {
+		if deviceGroup != "" && !groupMatch {
+			return nil, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", serial, deviceGroup)
+		}
+	} else if handlerMode == "computer" {
+		var computer JamfClassicComputer
+		if err := json.Unmarshal(response, &computer); err != nil {
+			return nil, fmt.Errorf("error fwhen unmarsalling Jamf API JSON: %s", err)
+		}
+		shared.WriteLog(fmt.Sprintf("Computer record %s has been matched for serial number %s", computer.Computer.General.UDID, serial), 1, 0)
+		resolved.UDID = computer.Computer.General.UDID
+		resolved.Name = computer.Computer.General.Name
+		resolved.SerialNumber = computer.Computer.General.SerialNumber
+		resolved.Username = computer.Computer.Location.Username
+		resolved.RealName = computer.Computer.Location.RealName
+		resolved.EmailAddress = computer.Computer.Location.EmailAddress
+		resolved.Position = computer.Computer.Location.Position
+		resolved.Department = computer.Computer.Location.Department
+		resolved.ExtensionAttributes = computer.Computer.ExtensionAttributes
 		for i := range computer.Computer.GroupsAccounts.ComputerGroupMemberships {
-			groups = append(groups, computer.Computer.GroupsAccounts.ComputerGroupMemberships[i])
-			if computer.Computer.GroupsAccounts.ComputerGroupMemberships[i] == computerGroup {
+			name := computer.Computer.GroupsAccounts.ComputerGroupMemberships[i]
+			resolved.Groups = append(resolved.Groups, name)
+			if computerGroup != "" && name == computerGroup {
 				groupMatch = true
-				shared.WriteLog(fmt.Sprintf("Computer device record %s is a member of \"%s\"", computer.Computer.General.UDID, computerGroup), 1, 0)
+				shared.WriteLog(fmt.Sprintf("Computer device record %s is a member of \"%s\"", resolved.UDID, computerGroup), 1, 0)
 			}
 		}
-	}
-	if deviceGroup != "" && !groupMatch && handlerMode == "mobiledevice" {
-		return webhook.ResponseBody{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, deviceGroup)
-	} else if computerGroup != "" && !groupMatch && handlerMode == "computer" {
-		return webhook.ResponseBody{Allow: false}, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", stepInputData.AttestationData.PermanentIdentifier, computerGroup)
+		if computerGroup != "" && !groupMatch {
+			return nil, fmt.Errorf("%s is not a member of supplied compliance group \"%s\"", serial, computerGroup)
+		}
 	}
 
-	var enrichData map[string]interface{}
-	if deviceEnrich && handlerMode == "mobiledevice" {
-		enrichData = map[string]interface{}{"device": map[string]interface{}{"udid": mobileDevice.MobileDevice.General.UDID, "serial_number": mobileDevice.MobileDevice.General.SerialNumber, "name": mobileDevice.MobileDevice.General.Name}, "user": map[string]interface{}{"username": mobileDevice.MobileDevice.Location.Username, "realname": mobileDevice.MobileDevice.Location.RealName, "email_address": mobileDevice.MobileDevice.Location.EmailAddress, "position": mobileDevice.MobileDevice.Location.Position, "department": mobileDevice.MobileDevice.Location.Department}, "groups": groups}
-	} else if computerEnrich && handlerMode == "computer" {
-		enrichData = map[string]interface{}{"device": map[string]interface{}{"udid": computer.Computer.General.UDID, "serial_number": computer.Computer.General.SerialNumber, "name": computer.Computer.General.Name}, "user": map[string]interface{}{"username": computer.Computer.Location.Username, "realname": computer.Computer.Location.RealName, "email_address": computer.Computer.Location.EmailAddress, "position": computer.Computer.Location.Position, "department": computer.Computer.Location.Department}, "groups": groups}
-	}
+	return resolved, nil
+}
 
-	// Data is an any on webhook.ResponseBody, so an unpopulated map would still
-	// read as non-nil downstream - only set it when we built enrichment data
-	if len(enrichData) > 0 {
-		return webhook.ResponseBody{Allow: true, Data: enrichData}, nil
-	} else {
-		return webhook.ResponseBody{Allow: true}, nil
+// buildEnrichData is a private function shared by Handler and SCEPHandler that builds the
+// enrichment data map returned to step-ca when enrichment is enabled.
+func buildEnrichData(resolved *resolvedDevice) map[string]interface{} {
+	return map[string]interface{}{
+		"device": map[string]interface{}{
+			"udid":          resolved.UDID,
+			"serial_number": resolved.SerialNumber,
+			"name":          resolved.Name,
+		},
+		"user": map[string]interface{}{
+			"username":      resolved.Username,
+			"realname":      resolved.RealName,
+			"email_address": resolved.EmailAddress,
+			"position":      resolved.Position,
+			"department":    resolved.Department,
+		},
+		"groups": resolved.Groups,
 	}
+}
+
+// expectedChallenge is a private function that resolves the SCEP challenge expected for a
+// device, either from the configured static challenge or from the value of the extension
+// attribute named by JAMF_SCEP_CHALLENGE_KEY.
+func expectedChallenge(resolved *resolvedDevice) (string, error) {
+	if scepStaticChallenge != "" {
+		return scepStaticChallenge, nil
+	}
+	if scepChallengeKey != "" {
+		for _, attr := range resolved.ExtensionAttributes {
+			if attr.Name == scepChallengeKey {
+				if attr.Value == "" {
+					return "", fmt.Errorf("extension attribute %q is empty for device %s", scepChallengeKey, resolved.SerialNumber)
+				}
+				return attr.Value, nil
+			}
+		}
+		names := make([]string, 0, len(resolved.ExtensionAttributes))
+		for _, attr := range resolved.ExtensionAttributes {
+			names = append(names, attr.Name)
+		}
+		shared.WriteLog(fmt.Sprintf("SCEP challenge extension attribute %q not found on device %s; available extension attribute names: %v", scepChallengeKey, resolved.SerialNumber, names), 1, 0)
+		return "", fmt.Errorf("device %s has no extension attribute named by JAMF_SCEP_CHALLENGE_KEY %q", resolved.SerialNumber, scepChallengeKey)
+	}
+	return "", fmt.Errorf("SCEP challenge validation is not configured")
 }
 
 // refreshAuthToken is a private function that is responsible for handling check & refresh
@@ -342,9 +484,8 @@ func validateAttestData(stepInputData webhook.RequestBody) error {
 	if stepInputData.AttestationData == nil {
 		return fmt.Errorf("received a request without any attestationData")
 	}
-	errs := validate.Var(stepInputData.AttestationData.PermanentIdentifier, "required,alphanum,min=8,max=14")
-	if errs != nil {
-		return fmt.Errorf("serial number did not pass validation: %s", errs)
+	if err := shared.ValidateSerial(stepInputData.AttestationData.PermanentIdentifier); err != nil {
+		return fmt.Errorf("serial number did not pass validation: %s", err)
 	}
 	return nil
 }
