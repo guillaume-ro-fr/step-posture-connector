@@ -13,6 +13,7 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/jedda/step-posture-connector/internal/providers/file"
 	"github.com/jedda/step-posture-connector/internal/providers/jamf"
+	"github.com/jedda/step-posture-connector/internal/providers/mosyle"
 	"github.com/jedda/step-posture-connector/internal/shared"
 	"github.com/joho/godotenv"
 	"github.com/smallstep/certificates/webhook"
@@ -66,7 +67,7 @@ func main() {
 	configRules := map[string]interface{}{
 		"LOGGING_LEVEL":   "omitempty,oneof=0 1 2",
 		"PORT":            "omitempty,number",
-		"PROVIDER":        "required,oneof=file jamf",
+		"PROVIDER":        "required,oneof=file jamf mosyle",
 		"TLS_CERT_PATH":   "required,file",
 		"TLS_KEY_PATH":    "required,file",
 		"TLS_CA_PATH":     "omitempty,file",
@@ -94,6 +95,8 @@ func main() {
 		provider = file.Provider{}
 	} else if providerName == "jamf" {
 		provider = jamf.Provider{}
+	} else if providerName == "mosyle" {
+		provider = mosyle.Provider{}
 	}
 	_, providerOk := provider.(ProviderInterface)
 	if !providerOk {
