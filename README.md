@@ -2,7 +2,7 @@
 
 Step Posture Connector (`step-posture-connector`) is a middleware tool designed to assist [`step-ca`](https://github.com/smallstep/certificates) with posture information during an ACME device attestation process.
 
-It was originally born to leverage [Managed Device Attestation for Apple devices](https://support.apple.com/en-au/guide/deployment/dep28afbde6a/web) in a [`step-ca`](https://github.com/smallstep/certificates) and Jamf Pro environment as a control to ensure that Apple attested ACME certificates are securely issued to approved, managed and compliant devices. It also supports flat files (JSON, CSV) and plans to incorporate other MDM providers such as Intune, Kandji and Mosyle.
+It was originally born to leverage [Managed Device Attestation for Apple devices](https://support.apple.com/en-au/guide/deployment/dep28afbde6a/web) in a [`step-ca`](https://github.com/smallstep/certificates) and Jamf Pro environment as a control to ensure that Apple attested ACME certificates are securely issued to approved, managed and compliant devices. It also supports flat files (JSON, CSV) and Mosyle Business/Manager, and plans to incorporate other MDM providers such as Intune and Kandji.
 
 Step Posture Connector utilises the [webhooks](https://smallstep.com/docs/step-ca/webhooks/) functionality within [`step-ca`](https://github.com/smallstep/certificates) to allow/deny and enrich certificates with additional data during the order process.
 
@@ -26,10 +26,11 @@ Below is the list of currently supported providers and  a brief explanation of w
 
 | Provider | Description |
 | --- | ----------- |
-| `file` | Reads a local file (JSON, CSV) with device identifiers and optional encrichment data and matches device requests against this list. Great for testing or gatekeeping against a specific static list of devices. |
-| `jamf` | Uses the Jamf API to match a device identifiers against an enrolled Mobile Device or Computer. Can use an optional compliance group to gatekeep a subset of devices and can return enrichment data. |
+| `file` | Reads a local file (JSON, CSV) with device identifiers and optional enrichment data and matches device requests against this list. Great for testing or gatekeeping against a specific static list of devices. |
+| `jamf` | Uses the Jamf API to match device identifiers against an enrolled Mobile Device or Computer. Can use an optional compliance group to gatekeep a subset of devices and can return enrichment data. |
+| `mosyle` | Uses the Mosyle Business/Manager API to match device identifiers across all device types (iOS, iPadOS, macOS, tvOS). Can require one or more compliance tags and can return enrichment data. |
 
-Ideally, next steps will include addition of new providers for posture & data enrichment. Happy to take feedback, but would suggest Intune, Kandji, Mosyle & Addigy as logical next steps.
+Ideally, next steps will include addition of new providers for posture & data enrichment. Happy to take feedback, but would suggest Intune, Kandji & Addigy as logical next steps.
 
 ## Security
 
@@ -80,7 +81,7 @@ The webhook endpoint takes an optional `type` query string that may be needed de
 
 Note that Jamf lookup will default to `mode=mobiledevice` if a mode is not defined, so only `mode=computer` is actually required to specifically target Macs. If you are using Jamf and want to target both iOS and Mac, youll need to create two different provisioners in [`step-ca`](https://github.com/smallstep/certificates) - one for each platform with it's own appropriate webhook pointing at the correct mode.
 
-The file provider ignores the `mode` query and treats every device type as the same.
+The `file` and `mosyle` providers ignore the `mode` query and treat every device type as the same.
 
 ## Compliance Group Membership
 
@@ -93,13 +94,13 @@ Where a group is defined, `step-posture-connector` will only allow a certificate
 
 ## Configuration
 
-Configuration is performed via environment variables; able to be supplied in the shell, via a .env file or via Docker when using the supplied Docker image (reccomended).`step-posture-connector` will validate configuration on start – including bootstrapping and checking your selected provider (although the error messages arent super friendly or verbose - something to improve on later).
+Configuration is performed via environment variables; able to be supplied in the shell, via a .env file or via Docker when using the supplied Docker image (recommended). `step-posture-connector` will validate configuration on start – including bootstrapping and checking your selected provider (although the error messages aren't super friendly or verbose - something to improve on later).
 
 ### Global Configuration
 
 | Environment Variable | Required | Description |
 | --- |  --- | ----------- |
-| `PROVIDER` | required | Specifies which provider to use. Currently needs to be one of `file` or `jamf`. |
+| `PROVIDER` | required | Specifies which provider to use. Currently needs to be one of `file`, `jamf` or `mosyle`. |
 | `TLS_CERT_PATH` | required | Specifies the file path of the PEM formatted certificate to use for the webhook server. |
 | `TLS_KEY_PATH` | required | Specifies the file path of the private key to use for the webhook server. |
 | `WEBHOOK_IDS` | required | Specifies a comma delimited list of `step-ca` webhook IDs. See "Webhooks" for details. |
@@ -131,7 +132,52 @@ The following additional configuration variables apply when using the `jamf` pro
 | `JAMF_DEVICE_GROUP` | optional | When included, specifies a Jamf Mobile Device group to check membership against for iOS devices. |
 | `JAMF_COMPUTER_GROUP` | optional | When included, specifies a Jamf Computer group to check membership against for Mac devices. |
 | `JAMF_DEVICE_ENRICH` | optional | Specifies if user enrichment data should be returned to `step-ca` for Mobile Devices. Needs to be `0` or `1`. Defaults to `0`. |
-| `JAMF_COMPUTER_ENRICH` | optional | Specifies if user enrichment data should be returned to `step-ca` for Computers. Needs to be `0` or `1`. Defaults to `0`.|
+| `JAMF_COMPUTER_ENRICH` | optional | Specifies if user enrichment data should be returned to `step-ca` for Computers. Needs to be `0` or `1`. Defaults to `0`. |
+
+### Provider Configuration - Mosyle Business/Manager (`mosyle`)
+
+The following additional configuration variables apply when using the `mosyle` provider. You'll need to generate an API access token from your Mosyle Business or Manager console.
+
+| Environment Variable | Required | Description |
+| --- |  --- | ----------- |
+| `MOSYLE_BASE_URL` | required | Specifies the base URL for the Mosyle API including the version prefix (eg. `https://businessapi.mosyle.com/v1`). |
+| `MOSYLE_ACCESS_TOKEN` | required | Specifies the Mosyle API access token used to authenticate the login request. |
+| `MOSYLE_EMAIL` | required | Specifies the email address of the Mosyle account used to obtain a bearer token. |
+| `MOSYLE_PASSWORD` | required | Specifies the password of the Mosyle account used to obtain a bearer token. |
+| `MOSYLE_TAGS` | optional | When included, specifies a comma-delimited list of Mosyle tags. Devices must carry at least one of these tags to be allowed. |
+| `MOSYLE_ENRICH` | optional | Specifies if enrichment data should be returned to `step-ca`. Needs to be `0` or `1`. Defaults to `0`. |
+
+When `MOSYLE_ENRICH` is enabled, the following data is returned to `step-ca` and can be used in certificate templates:
+
+```json
+{
+  "device": {
+    "udid": "...",
+    "serial_number": "...",
+    "name": "...",
+    "model": "...",
+    "os": "macOS",
+    "os_version": "14.4.1",
+    "is_supervised": true,
+    "enrollment_type": "DEP"
+  },
+  "user": {
+    "userid": "..."
+  },
+  "tags": ["corp", "production"]
+}
+```
+
+Unlike Jamf, the Mosyle API endpoint is unified across all device types, so a single provisioner and webhook can handle multiple platforms. The `mode` query parameter maps to the Mosyle `os` value as follows:
+
+| `mode` query value | Mosyle `os` |
+| --- | --- |
+| (empty) or `mobiledevice` | `ios` |
+| `computer` | `mac` |
+| `tvos` | `tvos` |
+| `visionos` | `visionos` |
+
+If you need to support multiple platforms, you can create separate provisioners in [`step-ca`](https://github.com/smallstep/certificates) each pointing at the same webhook URL with a different `mode` parameter, or use a single provisioner without a `mode` to default to iOS/iPadOS.
 
 ## Usage Philosophy & Considerations
 
