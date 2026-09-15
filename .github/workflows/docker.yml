@@ -1,0 +1,72 @@
+name: '🐳 Docker'
+
+on:
+    pull_request:
+        branches:
+            - main
+            - develop
+    push:
+        branches:
+            - main
+            - develop
+    workflow_dispatch:
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    id-token: write
+    actions: read
+    attestations: write
+    checks: write
+    packages: write
+
+jobs:
+
+    build-image:
+        name: 'Build Docker image'
+        runs-on: ubuntu-latest
+        outputs:
+            docker-tags: ${{ steps.meta.outputs.tags }}
+            digest: ${{ steps.build.outputs.digest }}
+        steps:
+            -   name: Checkout repository
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            -   name: Extract Docker metadata
+                id: meta
+                uses: docker/metadata-action@v6.2.0 # Immutable
+                with:
+                    context: workflow
+                    images: ghcr.io/guillaume-ro-fr/step-posture-connector
+                    flavor: latest=auto
+                    tags: |
+                        type=ref,event=branch
+                        type=ref,event=pr
+                        type=semver,pattern={{version}}
+                        type=semver,pattern={{major}}.{{minor}}
+                        type=raw,value=latest,enable={{is_default_branch}}
+
+            -   name: Login to GitHub Container Registry
+                uses: docker/login-action@v4.6.0 # Immutable
+                with:
+                    registry: ghcr.io
+                    username: ${{ github.actor }}
+                    password: ${{ secrets.GITHUB_TOKEN }}
+
+            -   name: Set up Docker Buildx
+                uses: docker/setup-buildx-action@v4.2.0 # Immutable
+
+            -   name: Build and push Docker image
+                id: build
+                uses: docker/build-push-action@v7.3.0 # Immutable
+                with:
+                    file: docker/Dockerfile
+                    target: runner
+                    pull: true
+                    push: true
+                    tags: ${{ steps.meta.outputs.tags }}
+                    labels: ${{ steps.meta.outputs.labels }}
+                    cache-from: type=registry,ref=ghcr.io/guillaume-ro-fr/step-posture-connector:cache
+                    cache-to: type=registry,ref=ghcr.io/guillaume-ro-fr/step-posture-connector:cache,mode=max
