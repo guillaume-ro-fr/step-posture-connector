@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,7 +13,15 @@ import (
 	"time"
 
 	"github.com/smallstep/certificates/webhook"
+	"go.step.sm/crypto/x509util"
 )
+
+// TestMain silences the provider's own logging, which shared.WriteLog sends straight to
+// stderr and go test does not capture per test.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
 
 // mosyleTestFixture builds a minimal Mosyle POST /v1/devices response.
 func mosyleTestFixture(devices []MosyleDevice) []byte {
@@ -61,10 +70,26 @@ func setupMosyleServer(t *testing.T, devicesHandler http.HandlerFunc) *httptest.
 	})
 }
 
+// mosyleEnvVars lists every environment variable this provider reads. setEnv blanks the
+// ones a test doesn't set itself, so the suite is hermetic: running `go test` from a shell
+// that has the deployment's own .env exported must not change any outcome.
+var mosyleEnvVars = []string{
+	"MOSYLE_BASE_URL", "MOSYLE_ACCESS_TOKEN", "MOSYLE_EMAIL", "MOSYLE_PASSWORD",
+	"MOSYLE_TAGS", "MOSYLE_ENRICH", "MOSYLE_SCEP_CHALLENGE", "MOSYLE_SCEP_CHALLENGE_KEY",
+	"TIMEOUT",
+}
+
 // setEnv sets env vars for the test and restores them on cleanup.
 func setEnv(t *testing.T, vars map[string]string) {
 	t.Helper()
 	originals := map[string]string{}
+	// start from a blank slate so an ambient value can never leak into a test
+	for _, k := range mosyleEnvVars {
+		if _, ok := vars[k]; !ok {
+			originals[k] = os.Getenv(k)
+			os.Setenv(k, "")
+		}
+	}
 	for k, v := range vars {
 		originals[k] = os.Getenv(k)
 		os.Setenv(k, v)
@@ -78,6 +103,8 @@ func setEnv(t *testing.T, vars map[string]string) {
 		validate = nil
 		config = nil
 		client = Client{}
+		scepStaticChallenge = ""
+		scepChallengeKey = ""
 	})
 }
 
@@ -811,5 +838,437 @@ func TestFlexBool_Unmarshal(t *testing.T) {
 				t.Errorf("%s: want %v, got %v", test.json, test.want, device.IsSupervised)
 			}
 		})
+	}
+}
+
+// ---- SCEP challenge tests ----
+
+// scepInput builds a SCEPCHALLENGE-shaped webhook.RequestBody carrying the serial in the
+// CSR subject's serialNumber attribute, as step-ca's challengeValidationController sends it.
+func scepInput(serial, challenge string) webhook.RequestBody {
+	return webhook.RequestBody{
+		SCEPTransactionID: "txn-1",
+		SCEPChallenge:     challenge,
+		X509CertificateRequest: &webhook.X509CertificateRequest{
+			CertificateRequest: &x509util.CertificateRequest{
+				Subject: x509util.Subject{SerialNumber: serial},
+			},
+		},
+	}
+}
+
+// mosyleEmbedded encodes a JSON document the way Mosyle embeds nested structures in its
+// responses: as a JSON string containing the document.
+func mosyleEmbedded(document string) string {
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+// deviceWithAttributes builds a device record whose CustomDeviceAttributes carries the given
+// attribute list, embedded as a JSON string exactly as POST /v1/devices delivers it, and
+// with the string booleans and null tags that endpoint really returns.
+func deviceWithAttributes(attributes string) string {
+	return `{
+	"serial_number": "SERIALNUM0001",
+	"deviceudid": "UDID-0001",
+	"device_name": "Test MacBook",
+	"device_model": "MacBookPro18,1",
+	"os": "mac",
+	"osversion": "14.0",
+	"is_supervised": "1",
+	"is_deleted": "0",
+	"status": "INSTALLED",
+	"userid": "user42",
+	"enrollment_type": "1:1",
+	"tags": null,
+	"CustomDeviceAttributes": ` + mosyleEmbedded(attributes) + `
+}`
+}
+
+// devicesEndpointAttributes is the attribute shape POST /v1/devices returns: the identifier
+// is CustomAttributeUniqueID and the bookkeeping fields are absent.
+const devicesEndpointAttributes = `[` +
+	`{"Name":"Some Other Attribute","CustomAttributeUniqueID":"custom_other","Value":"irrelevant"},` +
+	`{"Name":"SCEP Challenge","CustomAttributeUniqueID":"custom_cc_scepChallenge","Value":"myDynamicChallenge123"}` +
+	`]`
+
+// customAttributeEndpointAttributes is the shape Mosyle's custom attribute endpoints return:
+// the identifier is UniqueID, alongside LastUpdate, Source, OS and IsDeleted.
+const customAttributeEndpointAttributes = `[` +
+	`{"Name":"SCEP Challenge","UniqueID":"custom_cc_scepChallenge","Value":"myDynamicChallenge123",` +
+	`"LastUpdate":"1710266724","Source":"API","OS":"mac","IsDeleted":"0"}` +
+	`]`
+
+func TestSCEPHandler_StaticChallenge(t *testing.T) {
+	dev := defaultDevice()
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(mosyleTestFixture([]MosyleDevice{dev}))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE": "myStaticChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput(dev.Serial, "myStaticChallenge"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allow {
+		t.Fatal("expected the correct static challenge to be allowed")
+	}
+
+	resp, err = Provider{}.SCEPHandler("", scepInput(dev.Serial, "wrongChallenge"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected an incorrect static challenge to be denied")
+	}
+}
+
+// TestSCEPHandler_DynamicChallenge exercises the exact shape POST /v1/devices returns:
+// CustomDeviceAttributes as a JSON-encoded string, identifier in CustomAttributeUniqueID.
+func TestSCEPHandler_DynamicChallenge(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(deviceWithAttributes(devicesEndpointAttributes)))
+	})
+	// note the surrounding %...% as Mosyle's own profile variable syntax would produce -
+	// these must be trimmed automatically
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "%custom_cc_scepChallenge%"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "myDynamicChallenge123"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allow {
+		t.Fatal("expected the correct dynamic challenge to be allowed")
+	}
+
+	resp, err = Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "wrongChallenge"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected an incorrect dynamic challenge to be denied")
+	}
+}
+
+// The other identifier field name Mosyle uses must resolve identically.
+func TestSCEPHandler_DynamicChallengeByUniqueID(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(deviceWithAttributes(customAttributeEndpointAttributes)))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "custom_cc_scepChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "myDynamicChallenge123"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allow {
+		t.Fatal("expected an attribute identified by UniqueID to resolve too")
+	}
+}
+
+// The display Name is accepted as well, since that is what the Mosyle console shows.
+func TestSCEPHandler_DynamicChallengeByAttributeName(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(deviceWithAttributes(devicesEndpointAttributes)))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "SCEP Challenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "myDynamicChallenge123"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allow {
+		t.Fatal("expected a challenge held in a Custom Device Attribute to be matched by Name")
+	}
+}
+
+// A deleted attribute must not be usable as a challenge.
+func TestSCEPHandler_DynamicChallengeDeletedAttribute(t *testing.T) {
+	attributes := strings.Replace(customAttributeEndpointAttributes, `"IsDeleted":"0"`, `"IsDeleted":"1"`, 1)
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(deviceWithAttributes(attributes)))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "custom_cc_scepChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "myDynamicChallenge123"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected a deleted custom device attribute to be ignored, denying the request")
+	}
+}
+
+// TestMosyleDevice_UnmarshalJSON_CustomAttributes confirms the embedded attribute list
+// decodes into typed values alongside the device's own string booleans.
+func TestMosyleDevice_UnmarshalJSON_CustomAttributes(t *testing.T) {
+	var device MosyleDevice
+	if err := json.Unmarshal([]byte(deviceWithAttributes(devicesEndpointAttributes)), &device); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bool(device.IsSupervised) {
+		t.Error(`expected is_supervised "1" to decode to true via flexBool`)
+	}
+	if len(device.CustomAttributes) != 2 {
+		t.Fatalf("expected 2 custom device attributes, got %d", len(device.CustomAttributes))
+	}
+	attribute := device.CustomAttributes[1]
+	if attribute.ID() != "custom_cc_scepChallenge" {
+		t.Errorf("expected ID() to resolve to custom_cc_scepChallenge, got %q", attribute.ID())
+	}
+	if attribute.Value != "myDynamicChallenge123" {
+		t.Errorf("expected the attribute value to decode, got %q", attribute.Value)
+	}
+}
+
+// TestMosyleCustomAttribute_ID covers both identifier field names, and the precedence
+// between them when a payload somehow carries both.
+func TestMosyleCustomAttribute_ID(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"devices endpoint", `{"CustomAttributeUniqueID":"custom_a"}`, "custom_a"},
+		{"custom attribute endpoint", `{"UniqueID":"custom_b"}`, "custom_b"},
+		{"both present", `{"CustomAttributeUniqueID":"custom_a","UniqueID":"custom_b"}`, "custom_a"},
+		{"neither present", `{"Name":"SCEP Challenge"}`, ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var attribute MosyleCustomAttribute
+			if err := json.Unmarshal([]byte(test.json), &attribute); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := attribute.ID(); got != test.want {
+				t.Errorf("expected ID() %q, got %q", test.want, got)
+			}
+		})
+	}
+}
+
+// CustomDeviceAttributes arrives as a JSON document embedded in a JSON string. Absent, null
+// and empty mean the device carries none; any other shape must be a loud error rather than
+// a silently empty list.
+func TestCustomAttributes_Unmarshal(t *testing.T) {
+	attribute := `{"Name":"SCEP Challenge","CustomAttributeUniqueID":"custom_cc_scepChallenge","Value":"abc"}`
+	tests := []struct {
+		name    string
+		json    string
+		want    int
+		wantErr bool
+	}{
+		{"embedded list", `{"CustomDeviceAttributes":` + mosyleEmbedded(`[`+attribute+`]`) + `}`, 1, false},
+		{"embedded empty list", `{"CustomDeviceAttributes":"[]"}`, 0, false},
+		{"empty string", `{"CustomDeviceAttributes":""}`, 0, false},
+		{"null", `{"CustomDeviceAttributes":null}`, 0, false},
+		{"absent", `{}`, 0, false},
+		{"bare list", `{"CustomDeviceAttributes":[` + attribute + `]}`, 0, true},
+		{"unparseable string", `{"CustomDeviceAttributes":"not a list"}`, 0, true},
+		{"unexpected type", `{"CustomDeviceAttributes":42}`, 0, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var device MosyleDevice
+			err := json.Unmarshal([]byte(test.json), &device)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %s", test.json)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", test.json, err)
+			}
+			if len(device.CustomAttributes) != test.want {
+				t.Errorf("expected %d attributes, got %d", test.want, len(device.CustomAttributes))
+			}
+		})
+	}
+}
+
+// TestSCEPHandler_FullDeviceRecord replays a complete device record with the field set and
+// shapes POST /v1/devices really returns - including the nulls, the string booleans and the
+// several structures Mosyle embeds as JSON strings. It is the regression test for the two
+// things that broke against the live API: CustomDeviceAttributes arriving as a JSON-encoded
+// string, and the identifier field being named CustomAttributeUniqueID.
+//
+// All values are fictitious; only the structure mirrors a real response.
+func TestSCEPHandler_FullDeviceRecord(t *testing.T) {
+	const device = `{"deviceudid":"00000000-1111-2222-3333-444444444444","total_disk":"494.0000000000",` +
+		`"os":"mac","serial_number":"SERIALNUM0002","device_name":"Example MacBook Pro",` +
+		`"device_model":"MacBookPro18,1","osversion":"14.0","carrier":null,"imei":null,` +
+		`"is_supervised":"1","status":"INSTALLED","tags":null,"is_deleted":"0",` +
+		`"device_type":"COMPUTER","enrollment_type":"1:1","userid":"example.user",` +
+		`"OSUpdateSettings":"{\"AutoCheckEnabled\":true}","ActiveManagedUsers":"[\"AAAAAAAA\"]",` +
+		`"CustomDeviceAttributes":"[{\"Name\":\"SCEP Challenge\",\"CustomAttributeUniqueID\":\"custom_cc_scepChallenge\",\"Value\":\"example-challenge-value\"}]",` +
+		`"DeviceAttestationStatus":"Compliant","last_lan_ip":"10.0.0.1"}`
+
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(device))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "%custom_cc_scepChallenge%"})
+
+	resp, err := Provider{}.SCEPHandler("computer", scepInput("SERIALNUM0002", "example-challenge-value"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Allow {
+		t.Fatal("expected the challenge from a full Mosyle device record to be resolved and matched")
+	}
+
+	resp, err = Provider{}.SCEPHandler("computer", scepInput("SERIALNUM0002", "wrongChallenge"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected an incorrect challenge to be denied")
+	}
+}
+
+// A device record must survive a marshal/unmarshal round-trip, so that a fixture built from
+// a MosyleDevice value carries its attributes in the same embedded form the API uses.
+func TestCustomAttributes_RoundTrip(t *testing.T) {
+	original := MosyleDevice{
+		Serial: "SERIALNUM0001",
+		CustomAttributes: customAttributes{
+			{Name: "SCEP Challenge", CustomAttributeUniqueID: "custom_cc_scepChallenge", Value: "abc"},
+		},
+	}
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("unexpected error marshaling: %v", err)
+	}
+	var decoded MosyleDevice
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unexpected error unmarshaling: %v", err)
+	}
+	if len(decoded.CustomAttributes) != 1 {
+		t.Fatalf("expected 1 attribute after round-trip, got %d", len(decoded.CustomAttributes))
+	}
+	if decoded.CustomAttributes[0].ID() != "custom_cc_scepChallenge" {
+		t.Errorf("expected the identifier to survive, got %q", decoded.CustomAttributes[0].ID())
+	}
+	if decoded.CustomAttributes[0].Value != "abc" {
+		t.Errorf("expected the value to survive, got %q", decoded.CustomAttributes[0].Value)
+	}
+}
+
+// A device whose CustomDeviceAttributes came back as "" must be denied cleanly (challenge
+// not found) rather than failing the whole response decode.
+func TestSCEPHandler_CustomAttributesAsEmptyString(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(rawDeviceFixture(deviceWithAttributes("")))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "custom_cc_scepChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("SERIALNUM0001", "myDynamicChallenge123"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected a device with no custom attributes to be denied")
+	}
+	if strings.Contains(err.Error(), "unmarshal") || strings.Contains(err.Error(), "decode") {
+		t.Fatalf("expected a challenge-not-found denial, not a decode failure: %v", err)
+	}
+}
+
+func TestSCEPHandler_DynamicChallengeKeyMissing(t *testing.T) {
+	dev := defaultDevice()
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// dev carries no custom device attributes - the configured key won't be found
+		w.Write(mosyleTestFixture([]MosyleDevice{dev}))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE_KEY": "custom_cc_scepChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput(dev.Serial, "anything"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected a device with no value for the dynamic key to be denied")
+	}
+}
+
+func TestSCEPHandler_DeviceNotFound(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(mosyleTestFixture(nil))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE": "myStaticChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput("UNKNOWN00001", "myStaticChallenge"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected an unregistered serial number to be denied")
+	}
+}
+
+func TestSCEPHandler_DeviceDeleted(t *testing.T) {
+	dev := defaultDevice()
+	dev.IsDeleted = true
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(mosyleTestFixture([]MosyleDevice{dev}))
+	})
+	bootstrapWithServer(t, srv, map[string]string{"MOSYLE_SCEP_CHALLENGE": "myStaticChallenge"})
+
+	resp, err := Provider{}.SCEPHandler("", scepInput(dev.Serial, "myStaticChallenge"))
+	if err == nil || resp.Allow {
+		t.Fatal("expected a deleted device to be denied, even with the correct challenge")
+	}
+}
+
+func TestSCEPHandler_NotConfigured(t *testing.T) {
+	dev := defaultDevice()
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(mosyleTestFixture([]MosyleDevice{dev}))
+	})
+	// neither MOSYLE_SCEP_CHALLENGE nor MOSYLE_SCEP_CHALLENGE_KEY set
+	bootstrapWithServer(t, srv, nil)
+
+	scepResp, err := Provider{}.SCEPHandler("", scepInput(dev.Serial, "anything"))
+	if err == nil || scepResp.Allow {
+		t.Fatal("expected SCEP to be denied when no challenge validation is configured")
+	}
+
+	// ACME must be unaffected by SCEP being unconfigured
+	acmeResp, err := Provider{}.Handler("", defaultInput(dev.Serial))
+	if err != nil || !acmeResp.Allow {
+		t.Fatalf("expected ACME to still be allowed, got allow=%v err=%v", acmeResp.Allow, err)
+	}
+}
+
+func TestBootstrap_SCEPChallengeBothSet(t *testing.T) {
+	srv := setupMosyleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(mosyleTestFixture(nil))
+	})
+	env := baseEnv(srv.URL)
+	env["MOSYLE_SCEP_CHALLENGE"] = "myStaticChallenge"
+	env["MOSYLE_SCEP_CHALLENGE_KEY"] = "custom_cc_scepChallenge"
+	setEnv(t, env)
+
+	p := Provider{}
+	if err := p.Bootstrap(); err == nil {
+		t.Fatal("expected Bootstrap to fail when both MOSYLE_SCEP_CHALLENGE and MOSYLE_SCEP_CHALLENGE_KEY are set")
+	}
+}
+
+// Decoding a full device record must leave every modelled field populated, including the
+// string booleans and the null tags POST /v1/devices really returns.
+func TestMosyleDevice_UnmarshalJSON(t *testing.T) {
+	var device MosyleDevice
+	if err := json.Unmarshal([]byte(deviceWithAttributes(devicesEndpointAttributes)), &device); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if device.Serial != "SERIALNUM0001" {
+		t.Errorf("expected serial_number to decode, got %q", device.Serial)
+	}
+	if !bool(device.IsSupervised) {
+		t.Error(`expected is_supervised "1" to decode to true via flexBool`)
+	}
+	if bool(device.IsDeleted) {
+		t.Error(`expected is_deleted "0" to decode to false via flexBool`)
+	}
+	if device.Tags != nil {
+		t.Errorf("expected null tags to decode as nil, got %v", device.Tags)
+	}
+	if device.Status != "INSTALLED" {
+		t.Errorf("expected status to decode, got %q", device.Status)
 	}
 }
